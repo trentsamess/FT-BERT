@@ -12,7 +12,7 @@ from tqdm import tqdm, trange
 
 from dataset import SentenceGetter
 
-model = BertForTokenClassification.from_pretrained("bert-base-uncased", num_labels=len(tag2idx))
+model = BertForTokenClassification.from_pretrained("bert-base-uncased", num_labels=17)
 
 FULL_FINETUNING = True
 if FULL_FINETUNING:

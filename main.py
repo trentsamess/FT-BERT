@@ -7,7 +7,7 @@ import tornado.web
 from model import model, predict
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-model.load_state_dict(torch.load(os.path.join('/Users/kilDz/Downloads/', f"bert_weights.pth"), map_location=device.type))
+model.load_state_dict(torch.load(os.path.join('/Users/kilDz/Downloads/', f"bert_weights.pt"), map_location=device.type))
 model.eval()
 
 

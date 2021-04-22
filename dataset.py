@@ -47,9 +47,6 @@ class SentenceGetter(object):
             return None
 
 
-getter = SentenceGetter(dataset)
-
-
 def sentences_labels(getter):
     sentences = [" ".join([s[0] for s in sent]) for sent in getter.sentences]
     labels = [[s[1] for s in sent] for sent in getter.sentences]
