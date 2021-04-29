@@ -1,17 +1,25 @@
-import os
-
-import torch
 import tornado.ioloop
 import tornado.web
+from transformers import BertForTokenClassification
 
-from model import model, predict
+from dataset import import_data, split_data, convert_dataframe_to_data, tags_and_tag_to_idx, tokenizer
+from model import one_sentence_prediction_bert
 
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-model.load_state_dict(torch.load(os.path.join('/Users/kilDz/Downloads/', f"bert_weights.pt"), map_location=device.type))
-model.eval()
+path_to_dataset = '/home/andrei/Documents/ML/ner.csv'
+path_to_model = '/home/andrei/Documents/ML/bert_uncased/'
+
+data = import_data(path_to_dataset)
+training, testing = split_data(data)
+train_data = convert_dataframe_to_data(training)
+test_data = convert_dataframe_to_data(testing)
+_, tag_to_idx = tags_and_tag_to_idx(train_data, test_data)
+tag_values = list(tag_to_idx.keys())
+
+bert_model_loaded = BertForTokenClassification.from_pretrained(path_to_model)
 
 
-class BertHandler(tornado.web.RequestHandler):
+class Ner(tornado.web.RequestHandler):
+
     def get(self):
         form = """<form method="post">
         <input type="text" name="sentence"/>
@@ -21,18 +29,14 @@ class BertHandler(tornado.web.RequestHandler):
 
     def post(self):
         sentence = self.get_argument('sentence')
-        with torch.no_grad():
-            prediction = predict(sentence, 40)
+        prediction = one_sentence_prediction_bert(sentence, bert_model_loaded, tokenizer, tag_values)
         self.write(prediction)
 
 
-def make_app():
-    return tornado.web.Application([
-        (r"/", BertHandler),
-    ])
-
+application = tornado.web.Application([
+    (r"/", Ner),
+])
 
 if __name__ == "__main__":
-    app = make_app()
-    app.listen(3000)
-    tornado.ioloop.IOLoop.current().start()
+    application.listen(8888)
+    tornado.ioloop.IOLoop.instance().start()

@@ -1,138 +1,157 @@
-import numpy as np
-import tokenizer as tokenizer
-from sklearn.metrics import f1_score
-from torch.optim import Adam
-
 import torch
+from tqdm import trange, tqdm_notebook
 
-from keras.preprocessing.sequence import pad_sequences
-from pytorch_pretrained_bert import BertTokenizer, BertConfig
-from pytorch_pretrained_bert import BertForTokenClassification, BertAdam
-from tqdm import tqdm, trange
+import matplotlib.pyplot as plt
+import numpy as np
+import seaborn as sns
+from transformers import (
+    BertForTokenClassification,
+    BertTokenizer,
+    get_linear_schedule_with_warmup,
+    AdamW,
+)
 
-from dataset import SentenceGetter
+max_seq_length = 160
+batch_size = 8
+epochs = 3
 
-model = BertForTokenClassification.from_pretrained("bert-base-uncased", num_labels=17)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-FULL_FINETUNING = True
+bert_model = BertForTokenClassification.from_pretrained(
+    "bert-base-uncased",
+    # num_labels=len(tag_to_idx) - 1,  # excluding padding tag
+    output_attentions=False,
+    output_hidden_states=False,
+)
+
+FULL_FINETUNING = True  # We will be updating weights, set to False if you want to train only a linear classifier
+
 if FULL_FINETUNING:
-    param_optimizer = list(model.named_parameters())
-    no_decay = ['bias', 'gamma', 'beta']
+    param_optimizer = list(bert_model.named_parameters())
+    no_decay = ["bias", "gamma", "beta"]
+
     optimizer_grouped_parameters = [
-        {'params': [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)],
-         'weight_decay_rate': 0.01},
-        {'params': [p for n, p in param_optimizer if any(nd in n for nd in no_decay)],
-         'weight_decay_rate': 0.0}
+        {
+            "params": [
+                p for n, p in param_optimizer if not any(nd in n for nd in no_decay)
+            ],
+            "weight_decay_rate": 0.01,
+        },
+        {
+            "params": [
+                p for n, p in param_optimizer if any(nd in n for nd in no_decay)
+            ],
+            "weight_decay_rate": 0.0,
+        },
     ]
-else:
-    param_optimizer = list(model.classifier.named_parameters())
+else:  # Just training the linear classifier on top of BERT and keeping all other weights fixed
+    param_optimizer = list(bert_model.classifier.named_parameters())
     optimizer_grouped_parameters = [{"params": [p for n, p in param_optimizer]}]
-optimizer = Adam(optimizer_grouped_parameters, lr=3e-5)
+
+optimizer = AdamW(optimizer_grouped_parameters, lr=3e-5, eps=1e-8)
+
+# Total number of training steps is number of batches * number of epochs.
+# total_steps = len(train_data_loader) * epochs
+
+# Create the learning rate scheduler.train_tensor_dataset, train_sampler, train_data_loader
 
 
-def flat_accuracy(preds, labels):
-    pred_flat = np.argmax(preds, axis=2).flatten()
-    labels_flat = labels.flatten()
-    return np.sum(pred_flat == labels_flat) / len(labels_flat)
+# scheduler = get_linear_schedule_with_warmup(
+    # optimizer, num_warmup_steps=0, num_training_steps=total_steps
+# )
 
 
-def train(train_dataloader, valid_dataloader, tags_vals, device):
-    epochs = 5
-    max_grad_norm = 1.0
+max_grad_norm = 1.0  # for gradient clipping
+
+
+def bert_model_train(
+    bert_model, train_data_loader, epochs, max_grad_norm, optimizer, scheduler
+):
+    loss_values = []
 
     for _ in trange(epochs, desc="Epoch"):
-        # TRAIN loop
-        model.train()
-        tr_loss = 0
-        nb_tr_examples, nb_tr_steps = 0, 0
-        for step, batch in enumerate(train_dataloader):
+        # Put the model into training mode.
+        bert_model.train()
+        # Reset the total loss for this epoch.
+        total_loss = 0
+
+        # Training loop
+        epoch_iterator = tqdm_notebook(train_data_loader)
+        for step, batch in enumerate(epoch_iterator):
             # add batch to gpu
-            batch = tuple(t.to(device) for t in batch)
+            batch = tuple(tup.to(device) for tup in batch)
             b_input_ids, b_input_mask, b_labels = batch
+
+            # Clearing previously calculated gradients before performing a backward pass
+            bert_model.zero_grad()
+
             # forward pass
-            loss = model(b_input_ids, token_type_ids=None,
-                         attention_mask=b_input_mask, labels=b_labels)
-            # backward pass
+            # This will return the loss (rather than the model output)
+            # because we have provided the `labels`. Otherwise it returns labels
+            outputs = bert_model(
+                b_input_ids,
+                token_type_ids=None,
+                attention_mask=b_input_mask,
+                labels=b_labels,
+            )
+
+            # get the loss. Transformer models' output is a tuple
+            loss = outputs[0]
+
+            # Perform a backward pass to calculate the gradients
             loss.backward()
-            # track train loss
-            tr_loss += loss.item()
-            nb_tr_examples += b_input_ids.size(0)
-            nb_tr_steps += 1
-            # gradient clipping
-            torch.nn.utils.clip_grad_norm_(parameters=model.parameters(), max_norm=max_grad_norm)
+
+            # Add to total train loss
+            total_loss += loss.item()
+
+            # Clip the norm of the gradient
+            # This is to help prevent the "exploding gradients" problem
+            torch.nn.utils.clip_grad_norm_(
+                parameters=bert_model.parameters(), max_norm=max_grad_norm
+            )
+
             # update parameters
             optimizer.step()
-            model.zero_grad()
-        # print train loss per epoch
-        print("Train loss: {}".format(tr_loss / nb_tr_steps))
-        # VALIDATION on validation set
-        model.eval()
-        eval_loss, eval_accuracy = 0, 0
-        nb_eval_steps, nb_eval_examples = 0, 0
-        predictions, true_labels = [], []
-        for batch in valid_dataloader:
-            batch = tuple(t.to(device) for t in batch)
-            b_input_ids, b_input_mask, b_labels = batch
 
-            with torch.no_grad():
-                tmp_eval_loss = model(b_input_ids, token_type_ids=None,
-                                      attention_mask=b_input_mask, labels=b_labels)
-                logits = model(b_input_ids, token_type_ids=None,
-                               attention_mask=b_input_mask)
-            logits = logits.detach().cpu().numpy()
-            label_ids = b_labels.to('cpu').numpy()
-            predictions.extend([list(p) for p in np.argmax(logits, axis=2)])
-            true_labels.append(label_ids)
+            # Update the learning rate
+            scheduler.step()
 
-            tmp_eval_accuracy = flat_accuracy(logits, label_ids)
+        # Calculate the average loss over the training data.
+        avg_train_loss = total_loss / len(train_data_loader)
+        print(f"Average train loss: {avg_train_loss}")
 
-            eval_loss += tmp_eval_loss.mean().item()
-            eval_accuracy += tmp_eval_accuracy
+        # Store the loss value for plotting the learning curve.
+        loss_values.append(avg_train_loss)
 
-            nb_eval_examples += b_input_ids.size(0)
-            nb_eval_steps += 1
-        eval_loss = eval_loss / nb_eval_steps
-        print("Validation loss: {}".format(eval_loss))
-        print("Validation Accuracy: {}".format(eval_accuracy / nb_eval_steps))
-        pred_tags = [tags_vals[p_i] for p in predictions for p_i in p]
-        valid_tags = [tags_vals[l_ii] for l in true_labels for l_i in l for l_ii in l_i]
-        print("F1-Score: {}".format(f1_score(pred_tags, valid_tags, average='weighted')))
+    sns.set(style="darkgrid")
+    sns.set(font_scale=1.5)
+    plt.rcParams["figure.figsize"] = (12, 6)
+
+    plt.plot(loss_values, label="training loss")
+
+    plt.title("Training")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.legend()
+
+    plt.show()
 
 
-def predict(sentence, MAX_LEN):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    predictions = []
-    tags_vals = ['B-tim',
-                  'I-per',
-                  'I-org',
-                  'B-gpe',
-                  'B-art',
-                  'I-art',
-                  'I-nat',
-                  'I-geo',
-                  'B-per',
-                  'B-org',
-                  'O',
-                  'B-geo',
-                  'B-nat',
-                  'B-eve',
-                  'I-tim',
-                  'I-eve',
-                  'I-gpe']
-    tokenized_text = tokenizer.tokenize(sentence)
-    input_ids = pad_sequences([tokenizer.convert_tokens_to_ids(tokenized_text)],
-                              maxlen=MAX_LEN, dtype="long", truncating="post", padding="post")
-    attention_masks = [[float(i > 0) for i in ii] for ii in input_ids]
-    inputs = torch.tensor(input_ids)
-    masks = torch.tensor(attention_masks)
+def one_sentence_prediction_bert(test_sentence, bert_model, tokenizer, tag_values):
+    tokenized_sentence = tokenizer.encode(test_sentence)
+    input_ids = torch.tensor([tokenized_sentence]).cuda()
+
     with torch.no_grad():
-        model.eval()
-        inputs = inputs.to(device)
-        masks = masks.to(device)
-        logits = model(inputs, token_type_ids=None,
-                       attention_mask=masks)
-    logits = logits.detach().cpu().numpy()
-    predictions.extend([list(p) for p in np.argmax(logits, axis=2)])
-    pred_tags = [[tags_vals[p_i] for p_i in p] for p in predictions]
-    amount = len(sentence.split(' '))
-    return pred_tags[0][:amount]
+        output = bert_model(input_ids)
+    label_indices = np.argmax(output[0].to("cpu").numpy(), axis=2)
+
+    tokens = tokenizer.convert_ids_to_tokens(input_ids.to("cpu").numpy()[0])
+    new_tokens, new_labels = [], []
+    for token, label_idx in zip(tokens, label_indices[0]):
+        if token.startswith("##"):
+            new_tokens[-1] = new_tokens[-1] + token[2:]
+        else:
+            new_labels.append(tag_values[label_idx])
+            new_tokens.append(token)
+
+    return zip(new_tokens, new_labels)

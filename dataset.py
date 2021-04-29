@@ -1,119 +1,156 @@
-import pandas as pd
-
 import torch
+from torch.utils.data import DataLoader, TensorDataset, RandomSampler
 
-from torch.utils.data import TensorDataset, DataLoader, RandomSampler, SequentialSampler
-from keras.preprocessing.sequence import pad_sequences
 from sklearn.model_selection import train_test_split
-from pytorch_pretrained_bert import BertTokenizer, BertConfig
-from pytorch_pretrained_bert import BertForTokenClassification, BertAdam
+
+from keras.preprocessing.sequence import pad_sequences
+
+import pandas as pd
+from transformers import (
+    BertTokenizer,
+)
 
 
-def prepare_dataset(dframe):
-    dataset = {}
-    for sentence in range(len(dframe)):
-        labels, text = dframe['labels'][sentence], dframe['text'][sentence]
+def import_data(path):
+    data = pd.read_csv(path, encoding="ISO-8859-1", error_bad_lines=False)
+    return data
+
+
+def split_data(data):
+    training, testing = train_test_split(data, test_size=0.2)
+    return training, testing
+
+
+def convert_dataframe_to_data(input_data):
+    dataset = []
+    for sentence in range(len(input_data.index)):
+        labels, text = input_data['labels'][input_data.index[sentence]], input_data['text'][input_data.index[sentence]]
         labels, text = labels.split(' '), text.split(' ')
-        idx = [sentence + 1] * len(labels)
-        if len(labels) == len(text):
-            if type(dataset) == dict:
-                dataset = {'idx': idx, 'text': text, 'labels': labels}
-                dataset = pd.DataFrame(dataset)
-            else:
-                sentence_dict = {'idx': idx, 'text': text, 'labels': labels}
-                sentence_dict = pd.DataFrame(sentence_dict)
-                dataset = pd.concat([dataset, sentence_dict], ignore_index=True)
-                print(len(dataset))
-    dataset
+    if len(labels) == len(text):
+        sentence_tuple = (text, labels)
+        dataset.append(sentence_tuple)
+    return dataset
 
 
-class SentenceGetter(object):
-
-    def __init__(self, dataset):
-        self.n_sent = 1
-        self.dataset = dataset
-        self.empty = False
-        agg_func = lambda s: [(w, t) for w, t in zip(s["text"].values.tolist(),
-                                                     s["labels"].values.tolist())]
-        self.grouped = self.dataset.groupby("idx").apply(agg_func)
-        self.sentences = [s for s in self.grouped]
-
-    def get_next(self):
-        try:
-            s = self.grouped["Sentence: {}".format(self.n_sent)]
-            self.n_sent += 1
-            return s
-        except:
-            return None
+def tags_and_tag_to_idx(train_data, test_data):
+    tags = set()
+    for pair in train_data:
+        tags = set.union(tags, set(pair[1]))
+    for pair in test_data:
+        tags = set.union(tags, set(pair[1]))
+    tag_to_idx = {t: i for i, t in enumerate(tags)}
+    tag_to_idx['<PAD>'] = -1
+    return tags, tag_to_idx
 
 
-def sentences_labels(getter):
-    sentences = [" ".join([s[0] for s in sent]) for sent in getter.sentences]
-    labels = [[s[1] for s in sent] for sent in getter.sentences]
-    return sentences, labels
+max_seq_length = 160
+batch_size = 8
+epochs = 3
 
 
-def tags_idx(dataset):
-    tags_vals = list(set(dataset["labels"].values))
-    tag2idx = {t: i for i, t in enumerate(tags_vals)}
-    return tag2idx
+tokenizer = BertTokenizer.from_pretrained("bert-base-uncased", do_lower_case=True)
 
 
-MAX_LEN = 40
-bs = 64
+def tokenize_and_preserve_labels(sentence, text_labels):
+    tokenized_sentence = []
+    labels = []
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-n_gpu = torch.cuda.device_count()
+    for word, label in zip(sentence, text_labels):
 
+        tokenized_word = tokenizer.tokenize(word)
+        n_subwords = len(tokenized_word)
 
-def get_tokenizer():
-    tokenizer = BertTokenizer.from_pretrained('bert-base-uncased', do_lower_case=True)
-    return tokenizer
+        tokenized_sentence.extend(tokenized_word)
 
+        labels.extend([label] * n_subwords)
 
-def get_tokenized_texts(sentences, tokenizer):
-    tokenized_texts = [tokenizer.tokenize(sent) for sent in sentences]
-    return tokenized_texts
-
-
-def get_input_ids(tokenizer, tokenized_texts):
-    input_ids = pad_sequences([tokenizer.convert_tokens_to_ids(txt) for txt in tokenized_texts],
-                              maxlen=MAX_LEN, dtype="long", truncating="post", padding="post")
-    return input_ids
+    return tokenized_sentence, labels
 
 
-def get_attention_masks(input_ids):
-    attention_masks = [[float(i > 0) for i in ii] for ii in input_ids]
-    return attention_masks
+def prepair_train_data(train_data, tag_to_idx):
+    tokenized_sents_and_labels = [
+        tokenize_and_preserve_labels(*sent_lab) for sent_lab in train_data
+    ]
+
+    print(f"Tokens and tags after BERT tokenization:\n{tokenized_sents_and_labels[3]}\n\n")
+
+    input_ids = pad_sequences(
+        [
+            tokenizer.convert_tokens_to_ids(sent_lab[0])
+            for sent_lab in tokenized_sents_and_labels
+        ],
+        maxlen=max_seq_length,
+        dtype="long",
+        value=0.0,
+        truncating="post",
+        padding="post",
+    )
+
+    tags = pad_sequences(
+        [
+            [tag_to_idx.get(l) for l in sent_lab[1]]
+            for sent_lab in tokenized_sents_and_labels
+        ],
+        maxlen=max_seq_length,
+        value=tag_to_idx["<PAD>"],
+        padding="post",
+        dtype="long",
+        truncating="post",
+    )
+
+    # converting to tensors
+    train_inputs = torch.tensor(input_ids)
+    train_tags = torch.tensor(tags)
+
+    # getting masks to know where pad characters are
+    train_masks = (train_inputs > 0).float()
+
+    print(f"Sentence ids:\n{train_inputs[3]}\n\n")
+    print(f"Tags:\n{train_tags[3]}\n\n")
+    print(f"Masks:\n{train_masks[3]}\n\n")
+
+    train_tensor_dataset = TensorDataset(train_inputs, train_masks, train_tags)
+    train_sampler = RandomSampler(train_tensor_dataset)
+    train_data_loader = DataLoader(
+        train_tensor_dataset, sampler=train_sampler, batch_size=batch_size
+    )
+    return train_tensor_dataset, train_sampler, train_data_loader
 
 
-def make_a_split(input_ids,tags,attention_masks):
-    tr_inputs, val_inputs, tr_tags, val_tags = train_test_split(input_ids, tags,
-                                                                random_state=2018, test_size=0.1)
-    tr_masks, val_masks, _, _ = train_test_split(attention_masks, input_ids,
-                                                 random_state=2018, test_size=0.1)
-    return tr_inputs, val_inputs, tr_tags, val_tags, tr_masks, val_masks
+def prepair_test_data(test_data, tag_to_idx):
+    tokenized_sents_and_labels = [
+        tokenize_and_preserve_labels(*sent_lab) for sent_lab in test_data
+    ]
 
+    input_ids = pad_sequences(
+        [
+            tokenizer.convert_tokens_to_ids(sent_lab[0])
+            for sent_lab in tokenized_sents_and_labels
+        ],
+        maxlen=max_seq_length,
+        dtype="long",
+        value=0.0,
+        truncating="post",
+        padding="post",
+    )
 
-def turn_to_tensor(tr_inputs, val_inputs, tr_tags, val_tags, tr_masks, val_masks):
-    tr_inputs = torch.tensor(tr_inputs)
-    val_inputs = torch.tensor(val_inputs)
-    tr_tags = torch.tensor(tr_tags)
-    val_tags = torch.tensor(val_tags)
-    tr_masks = torch.tensor(tr_masks)
-    val_masks = torch.tensor(val_masks)
-    return tr_inputs, val_inputs, tr_tags, val_tags, tr_masks, val_masks
+    tags = pad_sequences(
+        [
+            [tag_to_idx.get(l) for l in sent_lab[1]]
+            for sent_lab in tokenized_sents_and_labels
+        ],
+        maxlen=max_seq_length,
+        value=tag_to_idx["<PAD>"],
+        padding="post",
+        dtype="long",
+        truncating="post",
+    )
 
+    test_inputs = torch.tensor(input_ids)
+    test_tags = torch.tensor(tags)
+    test_masks = (test_inputs > 0).float()
 
-def train_load(tr_inputs, tr_masks, tr_tags):
-    train_data = TensorDataset(tr_inputs, tr_masks, tr_tags)
-    train_sampler = RandomSampler(train_data)
-    train_dataloader = DataLoader(train_data, sampler=train_sampler, batch_size=bs)
-    return train_dataloader
+    test_tensor_dataset = TensorDataset(test_inputs, test_masks, test_tags)
+    test_data_loader = DataLoader(test_tensor_dataset, batch_size=1)
+    return test_tensor_dataset, test_data_loader
 
-
-def valid_load(val_inputs, val_masks, val_tags):
-    valid_data = TensorDataset(val_inputs, val_masks, val_tags)
-    valid_sampler = SequentialSampler(valid_data)
-    valid_dataloader = DataLoader(valid_data, sampler=valid_sampler, batch_size=bs)
-    return valid_dataloader
